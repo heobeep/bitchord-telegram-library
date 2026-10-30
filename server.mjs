@@ -13,6 +13,11 @@ import {
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  MANIFEST,
+  createMediaSignature,
+  verifyMediaSignature,
+} from "./src/contract.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
@@ -72,6 +77,7 @@ function requirePublicConfiguration() {
   if (!PUBLIC_CATALOG_ENABLED) return;
   const missing = [];
   if (!DISTRIBUTION_AUTHORIZED) missing.push("DISTRIBUTION_AUTHORIZED=true");
+  if (!INDEXING_ENABLED) missing.push("INDEXING_ENABLED=true");
   if (!PUBLIC_BASE_URL.startsWith("https://")) missing.push("PUBLIC_BASE_URL (HTTPS)");
   if (!process.env.DATABASE_URL) missing.push("DATABASE_URL");
   if (!TELEGRAM_API_ID || !TELEGRAM_API_HASH || !TELEGRAM_SESSION) missing.push("Telegram API credentials and session");
@@ -81,31 +87,10 @@ function requirePublicConfiguration() {
   if (missing.length) throw new Error("Public catalogue cannot start; missing configuration: " + missing.join(", "));
 }
 
-function makeManifest() {
-  return {
-    id: "app.heobeep.telegram-library",
-    name: "Telegram Music Library",
-    version: "0.1.0",
-    description: "A shared music catalogue from approved Telegram sources.",
-    resources: ["search", "stream"],
-    allowDownloads: 0,
-  };
-}
-
-function signMediaId(id, expires) {
-  return crypto.createHmac("sha256", STREAM_SIGNING_SECRET)
-    .update(id + "." + expires).digest("hex");
-}
-
-function safeEqualHex(a, b) {
-  if (!/^[a-f0-9]{64}$/i.test(a || "") || !/^[a-f0-9]{64}$/i.test(b || "")) return false;
-  return crypto.timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
-}
-
 function mediaUrlFor(req, id) {
   const base = PUBLIC_BASE_URL || (req.protocol + "://" + req.get("host"));
   const expires = Math.floor(Date.now() / 1000) + 10 * 60;
-  const sig = signMediaId(id, expires);
+  const sig = createMediaSignature(id, expires, STREAM_SIGNING_SECRET);
   return base + "/media/" + encodeURIComponent(id) +
     "?expires=" + expires + "&sig=" + sig;
 }
@@ -114,7 +99,20 @@ function formatFrom(filename, mimeType) {
   const extension = (filename || "").split(".").pop()?.toLowerCase();
   if (extension && AUDIO_EXTENSIONS.has(extension)) return extension;
   const subtype = (mimeType || "").split("/")[1]?.toLowerCase();
-  return subtype === "mpeg" ? "mp3" : (subtype || "mp3");
+  if (subtype === "mpeg") return "mp3";
+  return AUDIO_EXTENSIONS.has(subtype) ? subtype : "mp3";
+}
+
+function codecFrom(format) {
+  const codecs = {
+    m4a: "aac",
+    aac: "aac",
+    ogg: "vorbis",
+    opus: "opus",
+    wav: "pcm",
+    aiff: "pcm",
+  };
+  return codecs[format] || format;
 }
 
 async function createSchema() {
@@ -213,9 +211,11 @@ function extractAudio(message, sourceChat) {
     item && typeof item.fileName === "string"
   );
   const filename = filenameAttribute?.fileName || "";
-  const format = formatFrom(filename, document.mimeType || "");
-  const isAudio = (document.mimeType || "").startsWith("audio/") ||
-    Boolean(audioAttribute) || AUDIO_EXTENSIONS.has(format);
+  const mimeType = document.mimeType || "";
+  const extension = filename.split(".").pop()?.toLowerCase() || "";
+  const format = formatFrom(filename, mimeType);
+  const isAudio = mimeType.startsWith("audio/") ||
+    Boolean(audioAttribute) || AUDIO_EXTENSIONS.has(extension);
   if (!isAudio) return null;
 
   const fallbackTitle = filename.replace(/\.[^.]+$/, "") || "Untitled track";
@@ -234,7 +234,7 @@ function extractAudio(message, sourceChat) {
     album: null,
     duration: Number(audioAttribute?.duration || 0) || null,
     filename: filename.slice(0, 500) || null,
-    mime_type: document.mimeType || "application/octet-stream",
+    mime_type: mimeType || "application/octet-stream",
     format,
     file_size: document.size ? String(document.size) : null,
   };
@@ -270,13 +270,18 @@ async function indexSourceChat(sourceChat) {
 
 async function runIndexPass() {
   if (!INDEXING_ENABLED || !telegramReady || !SOURCE_CHATS.length || !DISTRIBUTION_AUTHORIZED) return;
-  const lock = await pool.query("SELECT pg_try_advisory_lock(72638142) AS locked");
-  if (!lock.rows[0]?.locked) {
-    log("info", "indexer_lock_held_elsewhere");
-    return;
-  }
 
+  // Keep the session-level advisory lock on one checked-out PostgreSQL connection.
+  const db = await pool.connect();
+  let locked = false;
   try {
+    const lock = await db.query("SELECT pg_try_advisory_lock(72638142) AS locked");
+    locked = Boolean(lock.rows[0]?.locked);
+    if (!locked) {
+      log("info", "indexer_lock_held_elsewhere");
+      return;
+    }
+
     let indexed = 0;
     for (const chat of SOURCE_CHATS) {
       indexed += await indexSourceChat(chat);
@@ -285,7 +290,8 @@ async function runIndexPass() {
   } catch (error) {
     log("error", "index_pass_failed", { error: error?.name || "Error" });
   } finally {
-    await pool.query("SELECT pg_advisory_unlock(72638142)");
+    if (locked) await db.query("SELECT pg_advisory_unlock(72638142)").catch(() => {});
+    db.release();
   }
 }
 
@@ -391,7 +397,7 @@ app.get("/healthz", async (_req, res) => {
 
 app.get("/manifest.json", (_req, res) => {
   res.set("Cache-Control", "public, max-age=300");
-  res.json(makeManifest());
+  res.json(MANIFEST);
 });
 
 const publicApiLimiter = rateLimit({
@@ -423,7 +429,7 @@ app.get("/stream/:id", publicApiLimiter, async (req, res, next) => {
     return res.json({
       url: mediaUrlFor(req, track.id),
       format,
-      codec: format === "mp3" ? "mp3" : format,
+      codec: codecFrom(format),
       container: format,
       manifest: "none",
       encrypted: false,
@@ -438,13 +444,9 @@ app.get("/media/:id", publicApiLimiter, async (req, res, next) => {
     if (!PUBLIC_CATALOG_ENABLED) return res.status(503).end();
     const expires = Number(req.query.expires);
     const signature = String(req.query.sig || "");
-    const now = Math.floor(Date.now() / 1000);
-    if (!Number.isSafeInteger(expires) || expires < now || expires > now + 11 * 60) {
-      return res.status(403).end();
-    }
-    if (!safeEqualHex(signature, signMediaId(req.params.id, expires))) {
-      return res.status(403).end();
-    }
+    if (!verifyMediaSignature(
+      req.params.id, expires, signature, STREAM_SIGNING_SECRET
+    )) return res.status(403).end();
 
     const track = await getTrack(req.params.id);
     if (!track) return res.status(404).end();
@@ -517,6 +519,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  log("fatal", "startup_failed", { error: error?.message || error?.name || "Error" });
+  log("fatal", "startup_failed", { error: error?.name || "Error" });
   process.exit(1);
 });
