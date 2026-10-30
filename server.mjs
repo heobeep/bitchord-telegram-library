@@ -301,21 +301,33 @@ async function indexSourceChat(sourceChat) {
   if (!cursor.backfill_complete) {
     // Backfill one page per pass, newest to oldest. This keeps initial
     // imports bounded and resumes safely after restarts.
-    const offsetId = Number(cursor.backfill_offset_id || 0);
+    let offsetId = Number(cursor.backfill_offset_id || 0);
     const pageSize = 200;
-    for await (const message of telegramClient.iterMessages(sourceChat, {
-      limit: pageSize,
-      ...(offsetId ? { offsetId } : {}),
-    })) {
-      const id = Number(message.id) || 0;
-      if (!id) continue;
-      newestMessageId = Math.max(newestMessageId, id);
-      oldestMessageId = oldestMessageId === 0 ? id : Math.min(oldestMessageId, id);
-      scanned += 1;
-      if (await upsertIndexedMessage(message, sourceChat)) indexed += 1;
+    const passLimit = INDEX_MESSAGE_LIMIT;
+
+    while (scanned < passLimit) {
+      const requestLimit = Math.min(pageSize, passLimit - scanned);
+      let pageCount = 0;
+      let pageOldestId = 0;
+      for await (const message of telegramClient.iterMessages(sourceChat, {
+        limit: requestLimit,
+        ...(offsetId ? { offsetId } : {}),
+      })) {
+        const id = Number(message.id) || 0;
+        if (!id) continue;
+        newestMessageId = Math.max(newestMessageId, id);
+        pageOldestId = pageOldestId === 0 ? id : Math.min(pageOldestId, id);
+        scanned += 1;
+        pageCount += 1;
+        if (await upsertIndexedMessage(message, sourceChat)) indexed += 1;
+      }
+
+      oldestMessageId = pageOldestId || oldestMessageId;
+      if (pageCount < requestLimit || !pageOldestId) break;
+      offsetId = pageOldestId;
     }
 
-    const complete = scanned < pageSize;
+    const complete = scanned < passLimit;
     await pool.query(
       `INSERT INTO source_cursors
         (source_chat, last_message_id, backfill_offset_id, backfill_complete, updated_at)
