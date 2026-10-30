@@ -132,6 +132,11 @@ async function createSchema() {
       indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (source_chat, message_id)
     );
+    CREATE TABLE IF NOT EXISTS source_cursors (
+      source_chat TEXT PRIMARY KEY,
+      last_message_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE INDEX IF NOT EXISTS tracks_search_idx
       ON tracks USING GIN (to_tsvector('simple',
         coalesce(title, '') || ' ' || coalesce(artist, '') || ' ' || coalesce(album, '')
@@ -218,7 +223,7 @@ function extractAudio(message, sourceChat) {
     Boolean(audioAttribute) || AUDIO_EXTENSIONS.has(extension);
   if (!isAudio) return null;
 
-  const fallbackTitle = filename.replace(/\.[^.]+$/, "") || "Untitled track";
+  const fallbackTitle = filename.replace(/\.[^.]+$/, "") || message.message?.trim() || "Untitled track";
   const title = (audioAttribute?.title || fallbackTitle || message.message || "").trim();
   const artist = (audioAttribute?.performer || "").trim() || null;
   const id = crypto.createHash("sha256")
@@ -241,10 +246,19 @@ function extractAudio(message, sourceChat) {
 }
 
 async function indexSourceChat(sourceChat) {
+  const cursorResult = await pool.query(
+    "SELECT last_message_id FROM source_cursors WHERE source_chat = $1",
+    [String(sourceChat)]
+  );
+  const lastMessageId = Number(cursorResult.rows[0]?.last_message_id || 0);
+  let newestMessageId = lastMessageId;
   let count = 0;
+
   for await (const message of telegramClient.iterMessages(sourceChat, {
     limit: INDEX_MESSAGE_LIMIT,
+    minId: lastMessageId,
   })) {
+    newestMessageId = Math.max(newestMessageId, Number(message.id) || 0);
     const track = extractAudio(message, sourceChat);
     if (!track) continue;
 
@@ -265,6 +279,15 @@ async function indexSourceChat(sourceChat) {
     );
     count += 1;
   }
+
+  await pool.query(
+    `INSERT INTO source_cursors (source_chat, last_message_id, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (source_chat) DO UPDATE SET
+       last_message_id = GREATEST(source_cursors.last_message_id, EXCLUDED.last_message_id),
+       updated_at = NOW()`,
+    [String(sourceChat), newestMessageId]
+  );
   return count;
 }
 
