@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.session
+*session*
+.DS_Store
+npm-debug.log*
+coverage/
+.cache/
