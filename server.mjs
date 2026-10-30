@@ -135,8 +135,14 @@ async function createSchema() {
     CREATE TABLE IF NOT EXISTS source_cursors (
       source_chat TEXT PRIMARY KEY,
       last_message_id BIGINT NOT NULL DEFAULT 0,
+      backfill_offset_id BIGINT NOT NULL DEFAULT 0,
+      backfill_complete BOOLEAN NOT NULL DEFAULT FALSE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE source_cursors
+      ADD COLUMN IF NOT EXISTS backfill_offset_id BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE source_cursors
+      ADD COLUMN IF NOT EXISTS backfill_complete BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS tracks_search_idx
       ON tracks USING GIN (to_tsvector('simple',
         coalesce(title, '') || ' ' || coalesce(artist, '') || ' ' || coalesce(album, '')
@@ -192,12 +198,15 @@ async function initialiseTelegram() {
     { connectionRetries: 5, maxConcurrentDownloads: 4 }
   );
   await telegramClient.connect();
-  telegramReady = await telegramClient.checkAuthorization();
-
-  if (!telegramReady) {
+  try {
+    // getMe() is a documented authenticated request; avoid relying on an
+    // undocumented checkAuthorization helper from older GramJS examples.
+    await telegramClient.getMe();
+    telegramReady = true;
+  } catch (error) {
     await telegramClient.disconnect();
     telegramClient = null;
-    throw new Error("The configured Telegram session is not authorised.");
+    throw new Error("The configured Telegram session is not authorised: " + (error?.name || "authentication failed"));
   }
 
   log("info", "telegram_connected");
@@ -210,7 +219,12 @@ function extractAudio(message, sourceChat) {
 
   const attributes = document.attributes || [];
   const audioAttribute = attributes.find((item) =>
-    item && (typeof item.duration === "number" || item.title || item.performer)
+    item && (
+      item.title ||
+      item.performer ||
+      item.voice ||
+      String(item.className || item._ || "").toLowerCase().includes("audio")
+    )
   );
   const filenameAttribute = attributes.find((item) =>
     item && typeof item.fileName === "string"
@@ -245,50 +259,115 @@ function extractAudio(message, sourceChat) {
   };
 }
 
-async function indexSourceChat(sourceChat) {
-  const cursorResult = await pool.query(
-    "SELECT last_message_id FROM source_cursors WHERE source_chat = $1",
-    [String(sourceChat)]
-  );
-  const lastMessageId = Number(cursorResult.rows[0]?.last_message_id || 0);
-  let newestMessageId = lastMessageId;
-  let count = 0;
-
-  for await (const message of telegramClient.iterMessages(sourceChat, {
-    limit: INDEX_MESSAGE_LIMIT,
-    minId: lastMessageId,
-  })) {
-    newestMessageId = Math.max(newestMessageId, Number(message.id) || 0);
-    const track = extractAudio(message, sourceChat);
-    if (!track) continue;
-
-    await pool.query(
-      `INSERT INTO tracks
-        (id, source_chat, message_id, title, artist, album, duration, filename, mime_type, format, file_size, indexed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-       ON CONFLICT (source_chat, message_id) DO UPDATE SET
-         title=EXCLUDED.title, artist=EXCLUDED.artist, album=EXCLUDED.album,
-         duration=EXCLUDED.duration, filename=EXCLUDED.filename,
-         mime_type=EXCLUDED.mime_type, format=EXCLUDED.format,
-         file_size=EXCLUDED.file_size, indexed_at=NOW()`,
-      [
-        track.id, track.source_chat, track.message_id, track.title, track.artist,
-        track.album, track.duration, track.filename, track.mime_type,
-        track.format, track.file_size,
-      ]
-    );
-    count += 1;
-  }
+async function upsertIndexedMessage(message, sourceChat) {
+  const track = extractAudio(message, sourceChat);
+  if (!track) return false;
 
   await pool.query(
-    `INSERT INTO source_cursors (source_chat, last_message_id, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (source_chat) DO UPDATE SET
-       last_message_id = GREATEST(source_cursors.last_message_id, EXCLUDED.last_message_id),
-       updated_at = NOW()`,
-    [String(sourceChat), newestMessageId]
+    `INSERT INTO tracks
+      (id, source_chat, message_id, title, artist, album, duration, filename, mime_type, format, file_size, indexed_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+     ON CONFLICT (source_chat, message_id) DO UPDATE SET
+       title=EXCLUDED.title, artist=EXCLUDED.artist, album=EXCLUDED.album,
+       duration=EXCLUDED.duration, filename=EXCLUDED.filename,
+       mime_type=EXCLUDED.mime_type, format=EXCLUDED.format,
+       file_size=EXCLUDED.file_size, indexed_at=NOW()`,
+    [
+      track.id, track.source_chat, track.message_id, track.title, track.artist,
+      track.album, track.duration, track.filename, track.mime_type,
+      track.format, track.file_size,
+    ]
   );
-  return count;
+  return true;
+}
+
+async function indexSourceChat(sourceChat) {
+  const cursorResult = await pool.query(
+    `SELECT last_message_id, backfill_offset_id, backfill_complete
+       FROM source_cursors WHERE source_chat = $1`,
+    [String(sourceChat)]
+  );
+  const cursor = cursorResult.rows[0] || {
+    last_message_id: 0,
+    backfill_offset_id: 0,
+    backfill_complete: false,
+  };
+
+  let newestMessageId = Number(cursor.last_message_id || 0);
+  let oldestMessageId = 0;
+  let indexed = 0;
+  let scanned = 0;
+
+  if (!cursor.backfill_complete) {
+    // Backfill one page per pass, newest to oldest. This keeps initial
+    // imports bounded and resumes safely after restarts.
+    const offsetId = Number(cursor.backfill_offset_id || 0);
+    const pageSize = 200;
+    for await (const message of telegramClient.iterMessages(sourceChat, {
+      limit: pageSize,
+      ...(offsetId ? { offsetId } : {}),
+    })) {
+      const id = Number(message.id) || 0;
+      if (!id) continue;
+      newestMessageId = Math.max(newestMessageId, id);
+      oldestMessageId = oldestMessageId === 0 ? id : Math.min(oldestMessageId, id);
+      scanned += 1;
+      if (await upsertIndexedMessage(message, sourceChat)) indexed += 1;
+    }
+
+    const complete = scanned < pageSize;
+    await pool.query(
+      `INSERT INTO source_cursors
+        (source_chat, last_message_id, backfill_offset_id, backfill_complete, updated_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (source_chat) DO UPDATE SET
+         last_message_id = GREATEST(source_cursors.last_message_id, EXCLUDED.last_message_id),
+         backfill_offset_id = EXCLUDED.backfill_offset_id,
+         backfill_complete = EXCLUDED.backfill_complete,
+         updated_at = NOW()`,
+      [String(sourceChat), newestMessageId, complete ? 0 : oldestMessageId, complete]
+    );
+    return indexed;
+  }
+
+  // Incremental sync drains every page newer than the committed cursor.
+  // The cursor is advanced only after all pages are processed, so a failed
+  // pass repeats already-seen rows safely instead of skipping messages.
+  const previousCursor = Number(cursor.last_message_id || 0);
+  let offsetId = 0;
+  const pageSize = 200;
+
+  while (true) {
+    let pageCount = 0;
+    let pageOldestId = 0;
+    for await (const message of telegramClient.iterMessages(sourceChat, {
+      limit: pageSize,
+      minId: previousCursor,
+      ...(offsetId ? { offsetId } : {}),
+    })) {
+      const id = Number(message.id) || 0;
+      if (!id) continue;
+      newestMessageId = Math.max(newestMessageId, id);
+      pageOldestId = pageOldestId === 0 ? id : Math.min(pageOldestId, id);
+      pageCount += 1;
+      if (await upsertIndexedMessage(message, sourceChat)) indexed += 1;
+    }
+
+    if (pageCount < pageSize || !pageOldestId || pageOldestId === offsetId) break;
+    offsetId = pageOldestId;
+  }
+
+  if (newestMessageId > previousCursor) {
+    await pool.query(
+      `INSERT INTO source_cursors (source_chat, last_message_id, backfill_complete, updated_at)
+       VALUES ($1,$2,TRUE,NOW())
+       ON CONFLICT (source_chat) DO UPDATE SET
+         last_message_id = GREATEST(source_cursors.last_message_id, EXCLUDED.last_message_id),
+         updated_at = NOW()`,
+      [String(sourceChat), newestMessageId]
+    );
+  }
+  return indexed;
 }
 
 async function runIndexPass() {
